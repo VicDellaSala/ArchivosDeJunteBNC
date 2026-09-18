@@ -678,14 +678,12 @@ with col1:
         "1. Recaudación Agentes Autorizados",
         type=["xlsx"],
         key="recaudacion",
-        max_upload_size=500,
     )
 with col2:
     archivo_diccionario = st.file_uploader(
         "2. Diccionario de manejadores",
         type=["xlsx"],
         key="diccionario",
-        max_upload_size=500,
     )
 
 archivos_r34 = st.file_uploader(
@@ -693,7 +691,6 @@ archivos_r34 = st.file_uploader(
     type=["csv", "txt", "xlsx", "xlsm", "zip"],
     accept_multiple_files=True,
     key="r34",
-    max_upload_size=500,
 )
 
 banco_objetivo = st.text_input(
