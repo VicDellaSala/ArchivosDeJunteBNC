@@ -178,6 +178,60 @@ def unir_unicos(serie):
     return " | ".join(vistos)
 
 
+def extraer_periodo_hoja_bnc(nombre_hoja):
+    """Extrae mes y año de nombres como 'BNC julio 2026'."""
+    meses = {
+        "ENERO": 1, "FEBRERO": 2, "MARZO": 3, "ABRIL": 4,
+        "MAYO": 5, "JUNIO": 6, "JULIO": 7, "AGOSTO": 8,
+        "SEPTIEMBRE": 9, "SETIEMBRE": 9, "OCTUBRE": 10,
+        "NOVIEMBRE": 11, "DICIEMBRE": 12,
+    }
+    nombres = {
+        1: "enero", 2: "febrero", 3: "marzo", 4: "abril",
+        5: "mayo", 6: "junio", 7: "julio", 8: "agosto",
+        9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre",
+    }
+
+    texto = normalizar_texto(nombre_hoja)
+    anio_match = re.search(r"20\d{2}", texto)
+    mes_encontrado = next((nombre for nombre in meses if nombre in texto), None)
+
+    if not anio_match or not mes_encontrado:
+        raise ValueError(
+            f"No pude identificar mes y año en la hoja '{nombre_hoja}'. "
+            "Debe tener un nombre como 'BNC julio 2026'."
+        )
+
+    mes = meses[mes_encontrado]
+    anio = int(anio_match.group())
+    etiqueta = f"{nombres[mes].capitalize()} {anio}"
+    return mes, anio, etiqueta
+
+
+def convertir_fecha_r34(serie):
+    """Convierte FECHA_INSTALACION a fecha, tolerando formatos mixtos y seriales de Excel."""
+    s = serie.astype(str).str.strip()
+
+    try:
+        fechas = pd.to_datetime(s, errors="coerce", dayfirst=True, format="mixed")
+    except TypeError:
+        # Compatibilidad por si se usa una versión antigua de pandas.
+        fechas = pd.to_datetime(s, errors="coerce", dayfirst=True)
+
+    # Respaldo para fechas guardadas como número serial de Excel.
+    numeros = pd.to_numeric(s.str.replace(",", ".", regex=False), errors="coerce")
+    mask_excel = fechas.isna() & numeros.between(20000, 80000)
+    if mask_excel.any():
+        fechas.loc[mask_excel] = pd.to_datetime(
+            numeros.loc[mask_excel],
+            unit="D",
+            origin="1899-12-30",
+            errors="coerce",
+        )
+
+    return fechas
+
+
 def cargar_recaudacion(contenido, hoja):
     df = pd.read_excel(
         io.BytesIO(contenido),
@@ -254,6 +308,13 @@ def resolver_columnas_r34(columnas):
         "NOMBRE_BANCO": buscar_columna(
             columnas, ["NOMBRE_BANCO", "NOMBRE BANCO", "NOMBREBANCO"]
         ),
+        "FECHA_INSTALACION": buscar_columna(
+            columnas,
+            [
+                "FECHA_INSTALACION", "FECHA INSTALACION", "FECHAINSTALACION",
+                "FECHA_INSTA", "FECHA INSTA"
+            ],
+        ),
         "CODIGO_AFIL": buscar_columna(
             columnas, ["CODIGO_AFIL", "CODIGO AFIL", "CODIGO_AFILIADO", "AFILIADO"]
         ),
@@ -274,8 +335,15 @@ def resolver_columnas_r34(columnas):
     }
 
 
-def filtrar_chunk_r34(df, columnas, mapa_manejadores, banco_objetivo, archivo_origen):
+def filtrar_chunk_r34(
+    df, columnas, mapa_manejadores, banco_objetivo, archivo_origen,
+    mes_objetivo, anio_objetivo
+):
     c = columnas
+
+    # PRIMER FILTRO: solo instalaciones del mismo mes/año de la hoja BNC elegida.
+    fechas = convertir_fecha_r34(df[c["FECHA_INSTALACION"]])
+    mask_fecha = fechas.dt.month.eq(mes_objetivo) & fechas.dt.year.eq(anio_objetivo)
 
     pertenencia = df[c["PERTENENCIA"]].map(normalizar_compacto)
     mask_pertenencia = (
@@ -299,7 +367,7 @@ def filtrar_chunk_r34(df, columnas, mapa_manejadores, banco_objetivo, archivo_or
     banco_target = normalizar_compacto(banco_objetivo)
     mask_banco = banco_norm.str.contains(re.escape(banco_target), na=False)
 
-    mask = mask_pertenencia & mask_manejador & mask_pos & mask_banco
+    mask = mask_fecha & mask_pertenencia & mask_manejador & mask_pos & mask_banco
     f = df.loc[mask].copy()
 
     if f.empty:
@@ -323,6 +391,7 @@ def filtrar_chunk_r34(df, columnas, mapa_manejadores, banco_objetivo, archivo_or
     out["MANEJADOR2"] = manejador2.loc[f.index]
     out["NOMBRE_BANCO"] = f[c["NOMBRE_BANCO"]].astype(str).str.strip()
     out["POS_CON_TRANSACCION"] = f[c["POS_CON_TRANSACCION"]].astype(str).str.strip()
+    out["FECHA_INSTALACION"] = convertir_fecha_r34(f[c["FECHA_INSTALACION"]]).dt.strftime("%d/%m/%Y")
 
     out = out[out["CLAVE_CRUCE"] != ""].reset_index(drop=True)
     return out
@@ -355,7 +424,7 @@ def detectar_csv(path):
     return encoding, sep
 
 
-def procesar_csv_r34(path, mapa_manejadores, banco_objetivo, nombre_origen):
+def procesar_csv_r34(path, mapa_manejadores, banco_objetivo, nombre_origen, mes_objetivo, anio_objetivo):
     encoding, sep = detectar_csv(path)
 
     cabecera = pd.read_csv(
@@ -382,7 +451,8 @@ def procesar_csv_r34(path, mapa_manejadores, banco_objetivo, nombre_origen):
         on_bad_lines="skip",
     ):
         filtrado = filtrar_chunk_r34(
-            chunk, columnas, mapa_manejadores, banco_objetivo, nombre_origen
+            chunk, columnas, mapa_manejadores, banco_objetivo, nombre_origen,
+            mes_objetivo, anio_objetivo
         )
         if not filtrado.empty:
             partes.append(filtrado)
@@ -390,30 +460,38 @@ def procesar_csv_r34(path, mapa_manejadores, banco_objetivo, nombre_origen):
     return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
-def procesar_excel_r34(path, mapa_manejadores, banco_objetivo, nombre_origen):
+def procesar_excel_r34(path, mapa_manejadores, banco_objetivo, nombre_origen, mes_objetivo, anio_objetivo):
     df = pd.read_excel(path, dtype=str, keep_default_na=False, engine="openpyxl")
     columnas = resolver_columnas_r34(df.columns)
     return filtrar_chunk_r34(
-        df, columnas, mapa_manejadores, banco_objetivo, nombre_origen
+        df, columnas, mapa_manejadores, banco_objetivo, nombre_origen,
+        mes_objetivo, anio_objetivo
     )
 
 
-def procesar_r34_subarchivo(path, mapa_manejadores, banco_objetivo, nombre_origen):
+def procesar_r34_subarchivo(
+    path, mapa_manejadores, banco_objetivo, nombre_origen, mes_objetivo, anio_objetivo
+):
     ext = Path(path).suffix.lower()
     if ext == ".csv" or ext == ".txt":
-        return procesar_csv_r34(path, mapa_manejadores, banco_objetivo, nombre_origen)
+        return procesar_csv_r34(
+            path, mapa_manejadores, banco_objetivo, nombre_origen, mes_objetivo, anio_objetivo
+        )
     if ext in {".xlsx", ".xlsm"}:
-        return procesar_excel_r34(path, mapa_manejadores, banco_objetivo, nombre_origen)
+        return procesar_excel_r34(
+            path, mapa_manejadores, banco_objetivo, nombre_origen, mes_objetivo, anio_objetivo
+        )
     raise ValueError(f"Formato R34 no soportado: {ext}")
 
 
-def procesar_upload_r34(upload, mapa_manejadores, banco_objetivo):
+def procesar_upload_r34(upload, mapa_manejadores, banco_objetivo, mes_objetivo, anio_objetivo):
     resultados = []
 
     with tempfile.TemporaryDirectory() as td:
         ruta = os.path.join(td, Path(upload.name).name)
+        upload.seek(0)
         with open(ruta, "wb") as f:
-            f.write(upload.getbuffer())
+            shutil.copyfileobj(upload, f, length=8 * 1024 * 1024)
 
         ext = Path(ruta).suffix.lower()
 
@@ -432,13 +510,15 @@ def procesar_upload_r34(upload, mapa_manejadores, banco_objetivo):
                         shutil.copyfileobj(src, dst)
                     nombre_origen = f"{upload.name} > {Path(miembro).name}"
                     r = procesar_r34_subarchivo(
-                        destino, mapa_manejadores, banco_objetivo, nombre_origen
+                        destino, mapa_manejadores, banco_objetivo, nombre_origen,
+                        mes_objetivo, anio_objetivo
                     )
                     if not r.empty:
                         resultados.append(r)
         else:
             r = procesar_r34_subarchivo(
-                ruta, mapa_manejadores, banco_objetivo, upload.name
+                ruta, mapa_manejadores, banco_objetivo, upload.name,
+                mes_objetivo, anio_objetivo
             )
             if not r.empty:
                 resultados.append(r)
@@ -503,7 +583,7 @@ def ajustar_anchos(worksheet, df, inicio_col=0, max_width=34):
         worksheet.set_column(inicio_col + i, inicio_col + i, min(ancho, max_width))
 
 
-def crear_excel(resultado, resumen, hoja_bnc, banco_objetivo):
+def crear_excel(resultado, resumen, hoja_bnc, banco_objetivo, periodo_r34):
     no_encontrados = resultado[resultado["ESTADO_CRUCE"] == "NO ENCONTRADO"].copy()
     cruzados = resultado[resultado["ESTADO_CRUCE"] == "CRUZADO"].copy()
 
@@ -528,7 +608,7 @@ def crear_excel(resultado, resumen, hoja_bnc, banco_objetivo):
         fmt_verde = workbook.add_format({"bg_color": "#E2F0D9"})
 
         # -------- RESUMEN --------
-        resumen.to_excel(writer, sheet_name="RESUMEN", index=False, startrow=9)
+        resumen.to_excel(writer, sheet_name="RESUMEN", index=False, startrow=10)
         ws = writer.sheets["RESUMEN"]
         ws.merge_range("A1:H1", "VALIDACIÓN BNC — R34 VS RECAUDACIÓN", fmt_titulo)
         ws.set_row(0, 28)
@@ -542,6 +622,7 @@ def crear_excel(resultado, resumen, hoja_bnc, banco_objetivo):
 
         metricas = [
             ("Período / hoja BNC", hoja_bnc),
+            ("FECHA_INSTALACION usada en R34", periodo_r34),
             ("Banco filtrado en R34", banco_objetivo),
             ("Registros R34 válidos", total_reg),
             ("Casos cruzados", total_cruz),
@@ -557,12 +638,12 @@ def crear_excel(resultado, resumen, hoja_bnc, banco_objetivo):
             else:
                 ws.write(fila, 1, valor, fmt_valor)
 
-        ws.write(8, 0, "Resumen por MANEJADOR2", fmt_label)
+        ws.write(9, 0, "Resumen por MANEJADOR2", fmt_label)
         for col_idx, col in enumerate(resumen.columns):
-            ws.write(9, col_idx, col, fmt_header)
+            ws.write(10, col_idx, col, fmt_header)
         if not resumen.empty:
-            ws.autofilter(9, 0, 9 + len(resumen), len(resumen.columns) - 1)
-        ws.freeze_panes(10, 0)
+            ws.autofilter(10, 0, 10 + len(resumen), len(resumen.columns) - 1)
+        ws.freeze_panes(11, 0)
         ajustar_anchos(ws, resumen)
         ws.set_column(0, 0, 28)
         ws.set_column(6, 7, 16, fmt_pct)
@@ -597,12 +678,14 @@ with col1:
         "1. Recaudación Agentes Autorizados",
         type=["xlsx"],
         key="recaudacion",
+        max_upload_size=500,
     )
 with col2:
     archivo_diccionario = st.file_uploader(
         "2. Diccionario de manejadores",
         type=["xlsx"],
         key="diccionario",
+        max_upload_size=500,
     )
 
 archivos_r34 = st.file_uploader(
@@ -610,6 +693,7 @@ archivos_r34 = st.file_uploader(
     type=["csv", "txt", "xlsx", "xlsm", "zip"],
     accept_multiple_files=True,
     key="r34",
+    max_upload_size=500,
 )
 
 banco_objetivo = st.text_input(
@@ -633,6 +717,14 @@ if archivo_recaudacion is not None:
                 opciones_bnc,
                 index=indice,
             )
+            try:
+                _mes, _anio, _periodo = extraer_periodo_hoja_bnc(hoja_bnc)
+                st.info(
+                    f"El R34 se filtrará SOLO por FECHA_INSTALACION de {_periodo}. "
+                    "Las filas de otros meses o años se ignorarán."
+                )
+            except Exception as e:
+                st.warning(str(e))
     except Exception as e:
         st.error(f"No pude leer las hojas de Recaudación: {e}")
 
@@ -644,20 +736,24 @@ if st.button("Procesar validación", type="primary", use_container_width=True):
     else:
         try:
             with st.spinner("Procesando archivos..."):
+                mes_objetivo, anio_objetivo, periodo_r34 = extraer_periodo_hoja_bnc(hoja_bnc)
                 mapa = cargar_diccionario(archivo_diccionario.getvalue())
                 rec_agg = cargar_recaudacion(archivo_recaudacion.getvalue(), hoja_bnc)
 
                 partes = []
                 for i, archivo in enumerate(archivos_r34, start=1):
                     st.write(f"Procesando R34 {i}/{len(archivos_r34)}: {archivo.name}")
-                    parte = procesar_upload_r34(archivo, mapa, banco_objetivo)
+                    parte = procesar_upload_r34(
+                        archivo, mapa, banco_objetivo, mes_objetivo, anio_objetivo
+                    )
                     if not parte.empty:
                         partes.append(parte)
 
                 if not partes:
                     raise ValueError(
                         "Después de aplicar los filtros no quedó ningún registro del R34. "
-                        "Revisa PERTENENCIA, MANEJADOR, POS_CON_TRANSACCION y NOMBRE_BANCO."
+                        f"Revisa FECHA_INSTALACION ({periodo_r34}), PERTENENCIA, MANEJADOR, "
+                        "POS_CON_TRANSACCION y NOMBRE_BANCO."
                     )
 
                 r34_filtrado = pd.concat(partes, ignore_index=True)
@@ -674,7 +770,7 @@ if st.button("Procesar validación", type="primary", use_container_width=True):
                     "ESTADO_CRUCE", "CLAVE_CRUCE", "CODIGO_AFIL", "NUMPOS",
                     "NOMBRE_AFILIADO", "RIF_AFILIADO", "PERTENENCIA",
                     "MANEJADOR", "MANEJADOR2", "NOMBRE_BANCO",
-                    "POS_CON_TRANSACCION", "CIUDAD", "ESTADO",
+                    "POS_CON_TRANSACCION", "FECHA_INSTALACION", "CIUDAD", "ESTADO",
                     "COINCIDENCIAS_RECAUDACION", "ARCHIVO_R34"
                 ]
                 primeras = [c for c in primeras if c in resultado.columns]
@@ -682,7 +778,9 @@ if st.button("Procesar validación", type="primary", use_container_width=True):
                 resultado = resultado[primeras + resto]
 
                 resumen = crear_resumen(resultado)
-                excel = crear_excel(resultado, resumen, hoja_bnc, banco_objetivo)
+                excel = crear_excel(
+                    resultado, resumen, hoja_bnc, banco_objetivo, periodo_r34
+                )
 
                 periodo_archivo = re.sub(r"[^A-Za-z0-9_-]+", "_", hoja_bnc).strip("_")
                 nombre_salida = f"Validacion_BNC_{periodo_archivo}.xlsx"
