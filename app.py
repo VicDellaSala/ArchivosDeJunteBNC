@@ -10,14 +10,14 @@ import tempfile
 import unicodedata
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from openpyxl import load_workbook
 
 
 st.set_page_config(page_title="Validación BNC - R34 vs Recaudación", layout="wide")
 
 st.title("Validación BNC — R34 vs Recaudación")
 st.caption(
-    "Detecta registros del R34 que cumplen los filtros definidos y verifica si existen en "
-    "Recaudación Agentes Autorizados."
+    "Filtra el R34 con las reglas definidas y compara la hoja BNC seleccionada contra esos registros."
 )
 
 
@@ -44,11 +44,15 @@ def normalizar_compacto(valor):
 
 
 def limpiar_id(valor):
-    """Convierte IDs numéricos a una forma comparable: 002 -> 2, 199.0 -> 199."""
+    """
+    Convierte identificadores numéricos a texto comparable.
+    Ejemplos: 002 -> 2, 199.0 -> 199, 8.6049082E+07 -> 86049082.
+    """
     if valor is None or pd.isna(valor):
         return ""
+
     s = str(valor).strip()
-    if not s or s.upper() in {"NAN", "NONE", "N/D", "NA", "N/A"}:
+    if not s or normalizar_texto(s) in {"NAN", "NONE", "N/D", "NA", "N/A"}:
         return ""
 
     s_num = s.replace(" ", "").replace(",", ".")
@@ -59,7 +63,6 @@ def limpiar_id(valor):
     except (InvalidOperation, ValueError):
         pass
 
-    # Último recurso: conservar solo dígitos.
     digitos = re.sub(r"\D", "", s)
     if not digitos:
         return ""
@@ -71,16 +74,16 @@ def serie_ids(serie):
 
 
 def buscar_columna(columnas, aliases, obligatoria=True):
-    """Busca columnas por nombre, no por posición."""
+    """Busca una columna por nombre normalizado, nunca por letra/posición."""
     mapa = {normalizar_compacto(c): c for c in columnas}
 
-    # 1) Coincidencia exacta normalizada.
+    # Coincidencia exacta normalizada.
     for alias in aliases:
         a = normalizar_compacto(alias)
         if a in mapa:
             return mapa[a]
 
-    # 2) Coincidencia parcial, solo si es inequívoca.
+    # Coincidencia parcial solo si es inequívoca.
     for alias in aliases:
         a = normalizar_compacto(alias)
         candidatos = [orig for norm, orig in mapa.items() if a in norm or norm in a]
@@ -95,7 +98,7 @@ def buscar_columna(columnas, aliases, obligatoria=True):
 
 
 # ============================================================
-# DICCIONARIO MANEJADOR CCRPOS
+# DICCIONARIO — SOLO HOJA MANEJADOR CCRPOS
 # ============================================================
 
 def cargar_diccionario(contenido):
@@ -107,9 +110,7 @@ def cargar_diccionario(contenido):
         None,
     )
     if hoja is None:
-        raise ValueError(
-            "El diccionario no contiene la hoja 'MANEJADOR CCRPOS'."
-        )
+        raise ValueError("El diccionario no contiene la hoja 'MANEJADOR CCRPOS'.")
 
     df = pd.read_excel(xls, sheet_name=hoja, dtype=str, keep_default_na=False)
     col_m1 = buscar_columna(df.columns, ["MANEJADOR"])
@@ -134,6 +135,7 @@ def hojas_bnc(contenido):
 
 
 def hoja_bnc_esperada(nombre_archivo, hojas):
+    """Si el archivo dice Mayo 2026, intenta sugerir BNC Abril 2026."""
     meses = {
         "ENERO": 1, "FEBRERO": 2, "MARZO": 3, "ABRIL": 4,
         "MAYO": 5, "JUNIO": 6, "JULIO": 7, "AGOSTO": 8,
@@ -167,72 +169,16 @@ def hoja_bnc_esperada(nombre_archivo, hojas):
     return hojas[0] if len(hojas) == 1 else None
 
 
-def unir_unicos(serie):
-    vistos = []
-    for v in serie:
-        s = str(v).strip()
-        if not s or s.upper() in {"NAN", "NONE"}:
-            continue
-        if s not in vistos:
-            vistos.append(s)
-    return " | ".join(vistos)
+def cargar_recaudacion(contenido, hoja, mapa_manejadores):
+    """
+    Carga la hoja BNC completa.
 
-
-def extraer_periodo_hoja_bnc(nombre_hoja):
-    """Extrae mes y año de nombres como 'BNC julio 2026'."""
-    meses = {
-        "ENERO": 1, "FEBRERO": 2, "MARZO": 3, "ABRIL": 4,
-        "MAYO": 5, "JUNIO": 6, "JULIO": 7, "AGOSTO": 8,
-        "SEPTIEMBRE": 9, "SETIEMBRE": 9, "OCTUBRE": 10,
-        "NOVIEMBRE": 11, "DICIEMBRE": 12,
-    }
-    nombres = {
-        1: "enero", 2: "febrero", 3: "marzo", 4: "abril",
-        5: "mayo", 6: "junio", 7: "julio", 8: "agosto",
-        9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre",
-    }
-
-    texto = normalizar_texto(nombre_hoja)
-    anio_match = re.search(r"20\d{2}", texto)
-    mes_encontrado = next((nombre for nombre in meses if nombre in texto), None)
-
-    if not anio_match or not mes_encontrado:
-        raise ValueError(
-            f"No pude identificar mes y año en la hoja '{nombre_hoja}'. "
-            "Debe tener un nombre como 'BNC julio 2026'."
-        )
-
-    mes = meses[mes_encontrado]
-    anio = int(anio_match.group())
-    etiqueta = f"{nombres[mes].capitalize()} {anio}"
-    return mes, anio, etiqueta
-
-
-def convertir_fecha_r34(serie):
-    """Convierte FECHA_INSTALACION a fecha, tolerando formatos mixtos y seriales de Excel."""
-    s = serie.astype(str).str.strip()
-
-    try:
-        fechas = pd.to_datetime(s, errors="coerce", dayfirst=True, format="mixed")
-    except TypeError:
-        # Compatibilidad por si se usa una versión antigua de pandas.
-        fechas = pd.to_datetime(s, errors="coerce", dayfirst=True)
-
-    # Respaldo para fechas guardadas como número serial de Excel.
-    numeros = pd.to_numeric(s.str.replace(",", ".", regex=False), errors="coerce")
-    mask_excel = fechas.isna() & numeros.between(20000, 80000)
-    if mask_excel.any():
-        fechas.loc[mask_excel] = pd.to_datetime(
-            numeros.loc[mask_excel],
-            unit="D",
-            origin="1899-12-30",
-            errors="coerce",
-        )
-
-    return fechas
-
-
-def cargar_recaudacion(contenido, hoja):
+    IMPORTANTE:
+    - CONCATENAR es la llave principal.
+    - Si CONCATENAR no existe, usa Afiliado + Terminal.
+    - Si un CONCATENAR aparece varias veces en BNC, NO es error.
+      Cada fila se conserva; para el cruce basta con que la clave exista en R34.
+    """
     df = pd.read_excel(
         io.BytesIO(contenido),
         sheet_name=hoja,
@@ -249,52 +195,52 @@ def cargar_recaudacion(contenido, hoja):
         df.columns, ["TERMINAL", "NUMPOS", "NUM POS"], obligatoria=False
     )
 
-    # Preferimos construir la llave por componentes para evitar notación científica.
-    if col_afiliado and col_terminal:
-        df["CLAVE_CRUCE"] = serie_ids(df[col_afiliado]) + serie_ids(df[col_terminal])
-    elif col_concat:
+    if col_concat:
         df["CLAVE_CRUCE"] = serie_ids(df[col_concat])
+    elif col_afiliado and col_terminal:
+        df["CLAVE_CRUCE"] = serie_ids(df[col_afiliado]) + serie_ids(df[col_terminal])
     else:
         raise ValueError(
-            "En Recaudación necesito 'Concatenar' o las columnas 'Afiliado' + 'Terminal'."
+            "En la hoja BNC necesito 'Concatenar' o las columnas 'Afiliado' + 'Terminal'."
         )
 
     df = df[df["CLAVE_CRUCE"] != ""].copy()
 
-    col_pago_ccr = buscar_columna(df.columns, ["PAGO CCR $", "PAGO CCR"], obligatoria=False)
-    col_pago_ban = buscar_columna(df.columns, ["PAGO BAN $", "PAGO BAN"], obligatoria=False)
-    col_pago_aa = buscar_columna(df.columns, ["PAGO A.A $", "PAGO AA $", "PAGO A.A"], obligatoria=False)
-    col_fecha = buscar_columna(
-        df.columns, ["FECHA", "FECHA PAGO", "FECHA COBRO", "FECHA DE PAGO"], obligatoria=False
-    )
+    # Columnas relevantes de BNC.
+    aliases = {
+        "BNC_FECHA_DOC": ["FECHA DOC.", "FECHA DOC", "FECHA"],
+        "BNC_CLIENTE": ["CLIENTE"],
+        "BNC_NOMBRE": ["NOMBRE 1", "NOMBRE"],
+        "BNC_CONCATENAR": ["CONCATENAR"],
+        "BNC_AFILIADO": ["AFILIADO"],
+        "BNC_TERMINAL": ["TERMINAL"],
+        "BNC_PAGO_CCR_USD": ["PAGO CCR $", "PAGO CCR"],
+        "BNC_PAGO_BAN_USD": ["PAGO BAN $", "PAGO BAN"],
+        "BNC_PAGO_AA_USD": ["PAGO A.A $", "PAGO AA $", "PAGO A.A"],
+        "BNC_MANEJADOR_R34": ["MANEJADOR R34"],
+        "BNC_MANEJADOR_R34_MODIFICADO": ["MANEJADOR R34 MODIFICADO"],
+        "BNC_EQUIPO_R34": ["EQUIPO R34"],
+    }
 
-    base = (
-        df.groupby("CLAVE_CRUCE", as_index=False)
-        .size()
-        .rename(columns={"size": "COINCIDENCIAS_RECAUDACION"})
-    )
+    out = pd.DataFrame(index=df.index)
+    out["CLAVE_CRUCE"] = df["CLAVE_CRUCE"]
 
-    extras = [
-        (col_pago_ccr, "PAGO_CCR_RECAUDACION"),
-        (col_pago_ban, "PAGO_BAN_RECAUDACION"),
-        (col_pago_aa, "PAGO_AA_RECAUDACION"),
-        (col_fecha, "FECHAS_RECAUDACION"),
-    ]
+    for salida, opciones in aliases.items():
+        col = buscar_columna(df.columns, opciones, obligatoria=False)
+        out[salida] = df[col].astype(str).str.strip() if col else ""
 
-    for original, nuevo in extras:
-        if original:
-            tmp = (
-                df.groupby("CLAVE_CRUCE")[original]
-                .apply(unir_unicos)
-                .reset_index(name=nuevo)
-            )
-            base = base.merge(tmp, on="CLAVE_CRUCE", how="left")
+    # MANEJADOR2 para el resumen.
+    manejador_mod = out["BNC_MANEJADOR_R34_MODIFICADO"].astype(str).str.strip()
+    manejador_orig = out["BNC_MANEJADOR_R34"].map(normalizar_texto)
+    desde_diccionario = manejador_orig.map(mapa_manejadores).fillna("")
+    out["MANEJADOR2_BNC"] = manejador_mod.where(manejador_mod != "", desde_diccionario)
+    out.loc[out["MANEJADOR2_BNC"].astype(str).str.strip() == "", "MANEJADOR2_BNC"] = "SIN MANEJADOR"
 
-    return base
+    return out.reset_index(drop=True)
 
 
 # ============================================================
-# R34
+# R34 — DETECCIÓN DE HOJA/ENCABEZADO + FILTROS
 # ============================================================
 
 def resolver_columnas_r34(columnas):
@@ -308,18 +254,14 @@ def resolver_columnas_r34(columnas):
         "NOMBRE_BANCO": buscar_columna(
             columnas, ["NOMBRE_BANCO", "NOMBRE BANCO", "NOMBREBANCO"]
         ),
-        "FECHA_INSTALACION": buscar_columna(
-            columnas,
-            [
-                "FECHA_INSTALACION", "FECHA INSTALACION", "FECHAINSTALACION",
-                "FECHA_INSTA", "FECHA INSTA"
-            ],
-        ),
+        "CONCATENAR": buscar_columna(columnas, ["CONCATENAR"], obligatoria=False),
         "CODIGO_AFIL": buscar_columna(
-            columnas, ["CODIGO_AFIL", "CODIGO AFIL", "CODIGO_AFILIADO", "AFILIADO"]
+            columnas,
+            ["CODIGO_AFIL", "CODIGO AFIL", "CODIGO_AFILIADO", "AFILIADO"],
+            obligatoria=False,
         ),
         "NUMPOS": buscar_columna(
-            columnas, ["NUMPOS", "NUM POS", "NUM_POS", "NUMERO POS"]
+            columnas, ["NUMPOS", "NUM POS", "NUM_POS", "NUMERO POS"], obligatoria=False
         ),
         "NOMBRE_AFILIADO": buscar_columna(
             columnas, ["NOMBRE_AFILIADO", "NOMBRE AFILIADO", "NOMBRE_AFIL"], obligatoria=False
@@ -335,39 +277,51 @@ def resolver_columnas_r34(columnas):
     }
 
 
-def filtrar_chunk_r34(
-    df, columnas, mapa_manejadores, banco_objetivo, archivo_origen,
-    mes_objetivo, anio_objetivo
-):
-    c = columnas
-
-    # PRIMER FILTRO: solo instalaciones del mismo mes/año de la hoja BNC elegida.
-    fechas = convertir_fecha_r34(df[c["FECHA_INSTALACION"]])
-    mask_fecha = fechas.dt.month.eq(mes_objetivo) & fechas.dt.year.eq(anio_objetivo)
-
-    pertenencia = df[c["PERTENENCIA"]].map(normalizar_compacto)
-    mask_pertenencia = (
-        pertenencia.str.contains("CREDICARDPOS", na=False)
-        | pertenencia.str.contains("ESPECIALCENTRO", na=False)
-        | pertenencia.str.contains("ESPECIALORIENTE", na=False)
-        | pertenencia.str.contains("ESPECIALOCCIDENTE", na=False)
+def validar_llave_r34(columnas):
+    if columnas.get("CONCATENAR"):
+        return
+    if columnas.get("CODIGO_AFIL") and columnas.get("NUMPOS"):
+        return
+    raise ValueError(
+        "En el R34 necesito 'Concatenar' o las columnas 'CODIGO_AFIL' + 'NUMPOS' para crear la llave."
     )
 
+
+def pertenencia_valida(serie):
+    p = serie.map(normalizar_compacto)
+    return (
+        p.str.contains("CREDICARDPOS", na=False)
+        | p.str.contains("ESPECIALCENTRO", na=False)
+        | p.str.contains("ESPECIALORIENTE", na=False)
+        | p.str.contains("ESPECIALOCCIDENTE", na=False)
+    )
+
+
+def filtrar_chunk_r34(df, columnas, mapa_manejadores, banco_objetivo, archivo_origen):
+    c = columnas
+    validar_llave_r34(c)
+
+    # 1) PERTENENCIA válida.
+    mask_pertenencia = pertenencia_valida(df[c["PERTENENCIA"]])
+
+    # 2) MANEJADOR debe estar en la hoja MANEJADOR CCRPOS del diccionario.
     manejador_norm = df[c["MANEJADOR"]].map(normalizar_texto)
     manejador2 = manejador_norm.map(mapa_manejadores)
     mask_manejador = manejador2.notna()
 
+    # 3) POS_CON_TRANSACCION = 1.
     pos = pd.to_numeric(
         df[c["POS_CON_TRANSACCION"]].astype(str).str.replace(",", ".", regex=False),
         errors="coerce",
     )
     mask_pos = pos.eq(1)
 
+    # 4) NOMBRE_BANCO = B.O.D (normalizado, por eso B.O.D / BOD funcionan igual).
     banco_norm = df[c["NOMBRE_BANCO"]].map(normalizar_compacto)
     banco_target = normalizar_compacto(banco_objetivo)
     mask_banco = banco_norm.str.contains(re.escape(banco_target), na=False)
 
-    mask = mask_fecha & mask_pertenencia & mask_manejador & mask_pos & mask_banco
+    mask = mask_pertenencia & mask_manejador & mask_pos & mask_banco
     f = df.loc[mask].copy()
 
     if f.empty:
@@ -375,26 +329,88 @@ def filtrar_chunk_r34(
 
     out = pd.DataFrame(index=f.index)
     out["ARCHIVO_R34"] = archivo_origen
-    out["CODIGO_AFIL"] = f[c["CODIGO_AFIL"]].astype(str).str.strip()
-    out["NUMPOS"] = f[c["NUMPOS"]].astype(str).str.strip()
-    out["CLAVE_CRUCE"] = serie_ids(f[c["CODIGO_AFIL"]]) + serie_ids(f[c["NUMPOS"]])
 
-    for salida in [
-        "NOMBRE_AFILIADO", "RIF_AFILIADO", "CIUDAD", "ESTADO",
-        "TERMINAL", "SERIAL", "AFIPOS"
-    ]:
-        original = c.get(salida)
+    # CONCATENAR directo si existe; si no, CODIGO_AFIL + NUMPOS.
+    if c.get("CONCATENAR"):
+        out["CLAVE_CRUCE"] = serie_ids(f[c["CONCATENAR"]])
+    else:
+        out["CLAVE_CRUCE"] = serie_ids(f[c["CODIGO_AFIL"]]) + serie_ids(f[c["NUMPOS"]])
+
+    out["R34_CODIGO_AFIL"] = (
+        f[c["CODIGO_AFIL"]].astype(str).str.strip() if c.get("CODIGO_AFIL") else ""
+    )
+    out["R34_NUMPOS"] = (
+        f[c["NUMPOS"]].astype(str).str.strip() if c.get("NUMPOS") else ""
+    )
+
+    opcionales = {
+        "R34_NOMBRE_AFILIADO": "NOMBRE_AFILIADO",
+        "R34_RIF_AFILIADO": "RIF_AFILIADO",
+        "R34_CIUDAD": "CIUDAD",
+        "R34_ESTADO": "ESTADO",
+        "R34_TERMINAL": "TERMINAL",
+        "R34_SERIAL": "SERIAL",
+        "R34_AFIPOS": "AFIPOS",
+    }
+    for salida, clave in opcionales.items():
+        original = c.get(clave)
         out[salida] = f[original].astype(str).str.strip() if original else ""
 
-    out["PERTENENCIA"] = f[c["PERTENENCIA"]].astype(str).str.strip()
-    out["MANEJADOR"] = f[c["MANEJADOR"]].astype(str).str.strip()
-    out["MANEJADOR2"] = manejador2.loc[f.index]
-    out["NOMBRE_BANCO"] = f[c["NOMBRE_BANCO"]].astype(str).str.strip()
-    out["POS_CON_TRANSACCION"] = f[c["POS_CON_TRANSACCION"]].astype(str).str.strip()
-    out["FECHA_INSTALACION"] = convertir_fecha_r34(f[c["FECHA_INSTALACION"]]).dt.strftime("%d/%m/%Y")
+    out["R34_PERTENENCIA"] = f[c["PERTENENCIA"]].astype(str).str.strip()
+    out["R34_MANEJADOR"] = f[c["MANEJADOR"]].astype(str).str.strip()
+    out["R34_MANEJADOR2"] = manejador2.loc[f.index].astype(str).str.strip()
+    out["R34_NOMBRE_BANCO"] = f[c["NOMBRE_BANCO"]].astype(str).str.strip()
+    out["R34_POS_CON_TRANSACCION"] = f[c["POS_CON_TRANSACCION"]].astype(str).str.strip()
 
     out = out[out["CLAVE_CRUCE"] != ""].reset_index(drop=True)
     return out
+
+
+def detectar_hoja_y_header_excel(path):
+    """
+    Encuentra automáticamente la hoja correcta del R34 y la fila de encabezados.
+    Así no importa que exista una 'Hoja1' vacía ni que la hoja útil tenga otro nombre.
+    """
+    requeridas = {
+        "PERTENENCIA",
+        "MANEJADOR",
+        "POSCONTRANSACCION",
+        "NOMBREBANCO",
+    }
+    llaves_posibles = {"CONCATENAR", "CODIGOAFIL", "AFILIADO", "NUMPOS"}
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    mejor = None
+    mejor_score = -1
+
+    try:
+        for ws in wb.worksheets:
+            for numero_fila, fila in enumerate(
+                ws.iter_rows(min_row=1, max_row=30, values_only=True), start=1
+            ):
+                valores = {
+                    normalizar_compacto(v)
+                    for v in fila
+                    if v is not None and str(v).strip() != ""
+                }
+
+                score = sum(1 for req in requeridas if req in valores)
+                tiene_llave = bool(valores & llaves_posibles)
+
+                if score >= 4 and tiene_llave and score > mejor_score:
+                    mejor = (ws.title, numero_fila - 1)  # header de pandas es base 0
+                    mejor_score = score
+    finally:
+        wb.close()
+
+    if mejor is None:
+        raise ValueError(
+            "No pude localizar automáticamente la hoja/encabezado del R34. "
+            "Busqué PERTENENCIA, MANEJADOR, POS_CON_TRANSACCION y NOMBRE_BANCO "
+            "en las primeras 30 filas de todas las hojas."
+        )
+
+    return mejor
 
 
 def detectar_csv(path):
@@ -424,7 +440,7 @@ def detectar_csv(path):
     return encoding, sep
 
 
-def procesar_csv_r34(path, mapa_manejadores, banco_objetivo, nombre_origen, mes_objetivo, anio_objetivo):
+def procesar_csv_r34(path, mapa_manejadores, banco_objetivo, nombre_origen):
     encoding, sep = detectar_csv(path)
 
     cabecera = pd.read_csv(
@@ -436,6 +452,7 @@ def procesar_csv_r34(path, mapa_manejadores, banco_objetivo, nombre_origen, mes_
         nrows=0,
     )
     columnas = resolver_columnas_r34(cabecera.columns)
+    validar_llave_r34(columnas)
 
     necesarias = list(dict.fromkeys(v for v in columnas.values() if v))
     partes = []
@@ -451,8 +468,7 @@ def procesar_csv_r34(path, mapa_manejadores, banco_objetivo, nombre_origen, mes_
         on_bad_lines="skip",
     ):
         filtrado = filtrar_chunk_r34(
-            chunk, columnas, mapa_manejadores, banco_objetivo, nombre_origen,
-            mes_objetivo, anio_objetivo
+            chunk, columnas, mapa_manejadores, banco_objetivo, nombre_origen
         )
         if not filtrado.empty:
             partes.append(filtrado)
@@ -460,31 +476,44 @@ def procesar_csv_r34(path, mapa_manejadores, banco_objetivo, nombre_origen, mes_
     return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
-def procesar_excel_r34(path, mapa_manejadores, banco_objetivo, nombre_origen, mes_objetivo, anio_objetivo):
-    df = pd.read_excel(path, dtype=str, keep_default_na=False, engine="openpyxl")
+def procesar_excel_r34(path, mapa_manejadores, banco_objetivo, nombre_origen):
+    hoja, header_row = detectar_hoja_y_header_excel(path)
+
+    df = pd.read_excel(
+        path,
+        sheet_name=hoja,
+        header=header_row,
+        dtype=str,
+        keep_default_na=False,
+        engine="openpyxl",
+    )
+    df.columns = [str(c).strip() for c in df.columns]
+
     columnas = resolver_columnas_r34(df.columns)
+    validar_llave_r34(columnas)
+
     return filtrar_chunk_r34(
-        df, columnas, mapa_manejadores, banco_objetivo, nombre_origen,
-        mes_objetivo, anio_objetivo
+        df, columnas, mapa_manejadores, banco_objetivo, nombre_origen
     )
 
 
-def procesar_r34_subarchivo(
-    path, mapa_manejadores, banco_objetivo, nombre_origen, mes_objetivo, anio_objetivo
-):
+def procesar_r34_subarchivo(path, mapa_manejadores, banco_objetivo, nombre_origen):
     ext = Path(path).suffix.lower()
-    if ext == ".csv" or ext == ".txt":
+
+    if ext in {".csv", ".txt"}:
         return procesar_csv_r34(
-            path, mapa_manejadores, banco_objetivo, nombre_origen, mes_objetivo, anio_objetivo
+            path, mapa_manejadores, banco_objetivo, nombre_origen
         )
+
     if ext in {".xlsx", ".xlsm"}:
         return procesar_excel_r34(
-            path, mapa_manejadores, banco_objetivo, nombre_origen, mes_objetivo, anio_objetivo
+            path, mapa_manejadores, banco_objetivo, nombre_origen
         )
+
     raise ValueError(f"Formato R34 no soportado: {ext}")
 
 
-def procesar_upload_r34(upload, mapa_manejadores, banco_objetivo, mes_objetivo, anio_objetivo):
+def procesar_upload_r34(upload, mapa_manejadores, banco_objetivo):
     resultados = []
 
     with tempfile.TemporaryDirectory() as td:
@@ -500,25 +529,27 @@ def procesar_upload_r34(upload, mapa_manejadores, banco_objetivo, mes_objetivo, 
                 miembros = [
                     m for m in z.namelist()
                     if Path(m).suffix.lower() in {".csv", ".txt", ".xlsx", ".xlsm"}
+                    and not Path(m).name.startswith("~$")
+                    and not m.startswith("__MACOSX/")
                 ]
+
                 if not miembros:
-                    raise ValueError(f"{upload.name}: el ZIP no contiene CSV/XLSX.")
+                    raise ValueError(f"{upload.name}: el ZIP no contiene CSV/XLSX válidos.")
 
                 for i, miembro in enumerate(miembros, start=1):
                     destino = os.path.join(td, f"extraido_{i}{Path(miembro).suffix.lower()}")
                     with z.open(miembro) as src, open(destino, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
+                        shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
+
                     nombre_origen = f"{upload.name} > {Path(miembro).name}"
                     r = procesar_r34_subarchivo(
-                        destino, mapa_manejadores, banco_objetivo, nombre_origen,
-                        mes_objetivo, anio_objetivo
+                        destino, mapa_manejadores, banco_objetivo, nombre_origen
                     )
                     if not r.empty:
                         resultados.append(r)
         else:
             r = procesar_r34_subarchivo(
-                ruta, mapa_manejadores, banco_objetivo, upload.name,
-                mes_objetivo, anio_objetivo
+                ruta, mapa_manejadores, banco_objetivo, upload.name
             )
             if not r.empty:
                 resultados.append(r)
@@ -527,29 +558,100 @@ def procesar_upload_r34(upload, mapa_manejadores, banco_objetivo, mes_objetivo, 
 
 
 # ============================================================
+# CRUCE: LA BASE DE SALIDA ES BNC
+# ============================================================
+
+def preparar_r34_para_cruce(r34_filtrado):
+    """
+    Deja una fila representativa por CLAVE_CRUCE para que un duplicado del R34
+    no multiplique las filas de BNC al hacer el merge.
+    """
+    conteos = (
+        r34_filtrado.groupby("CLAVE_CRUCE", as_index=False)
+        .size()
+        .rename(columns={"size": "COINCIDENCIAS_R34"})
+    )
+
+    detalle = r34_filtrado.drop_duplicates("CLAVE_CRUCE", keep="first").copy()
+    return detalle.merge(conteos, on="CLAVE_CRUCE", how="left")
+
+
+def cruzar_bnc_con_r34(bnc, r34_filtrado):
+    """
+    Última regla indicada:
+    NO ENCONTRADOS = registros que ESTÁN EN BNC pero cuya CLAVE_CRUCE NO existe en R34.
+    CASOS CRUZADOS = registros de BNC cuya CLAVE_CRUCE sí existe en R34.
+    """
+    r34_unico = preparar_r34_para_cruce(r34_filtrado)
+    resultado = bnc.merge(r34_unico, on="CLAVE_CRUCE", how="left")
+
+    resultado["ESTADO_CRUCE"] = resultado["COINCIDENCIAS_R34"].apply(
+        lambda x: "CRUZADO" if pd.notna(x) else "NO ENCONTRADO EN R34"
+    )
+    resultado["COINCIDENCIAS_R34"] = (
+        resultado["COINCIDENCIAS_R34"].fillna(0).astype(int)
+    )
+
+    primeras = [
+        "ESTADO_CRUCE",
+        "CLAVE_CRUCE",
+        "BNC_FECHA_DOC",
+        "BNC_CLIENTE",
+        "BNC_NOMBRE",
+        "BNC_CONCATENAR",
+        "BNC_AFILIADO",
+        "BNC_TERMINAL",
+        "BNC_PAGO_CCR_USD",
+        "BNC_PAGO_BAN_USD",
+        "BNC_PAGO_AA_USD",
+        "BNC_MANEJADOR_R34",
+        "BNC_MANEJADOR_R34_MODIFICADO",
+        "MANEJADOR2_BNC",
+        "BNC_EQUIPO_R34",
+        "COINCIDENCIAS_R34",
+        "R34_CODIGO_AFIL",
+        "R34_NUMPOS",
+        "R34_NOMBRE_AFILIADO",
+        "R34_RIF_AFILIADO",
+        "R34_PERTENENCIA",
+        "R34_MANEJADOR",
+        "R34_MANEJADOR2",
+        "R34_NOMBRE_BANCO",
+        "R34_POS_CON_TRANSACCION",
+        "R34_TERMINAL",
+        "R34_SERIAL",
+        "R34_CIUDAD",
+        "R34_ESTADO",
+        "ARCHIVO_R34",
+    ]
+    primeras = [c for c in primeras if c in resultado.columns]
+    resto = [c for c in resultado.columns if c not in primeras]
+    return resultado[primeras + resto]
+
+
+# ============================================================
 # RESUMEN Y EXCEL FINAL
 # ============================================================
 
-def crear_resumen(df):
+def crear_resumen(resultado):
     filas = []
-    for manejador, g in df.groupby("MANEJADOR2", dropna=False):
-        total = len(g)
-        cruzados = int((g["ESTADO_CRUCE"] == "CRUZADO").sum())
-        no_encontrados = total - cruzados
-        clientes = g["CODIGO_AFIL"].nunique()
-        clientes_faltantes = g.loc[
-            g["ESTADO_CRUCE"] == "NO ENCONTRADO", "CODIGO_AFIL"
+
+    for manejador, g in resultado.groupby("MANEJADOR2_BNC", dropna=False):
+        claves = g["CLAVE_CRUCE"].nunique()
+        cruzadas = g.loc[g["ESTADO_CRUCE"] == "CRUZADO", "CLAVE_CRUCE"].nunique()
+        no_encontradas = g.loc[
+            g["ESTADO_CRUCE"] == "NO ENCONTRADO EN R34", "CLAVE_CRUCE"
         ].nunique()
 
         filas.append({
-            "MANEJADOR2": manejador or "SIN MANEJADOR",
-            "REGISTROS_R34": total,
-            "CLIENTES_UNICOS": clientes,
-            "CRUZADOS": cruzados,
-            "NO_ENCONTRADOS": no_encontrados,
-            "CLIENTES_UNICOS_NO_ENCONTRADOS": clientes_faltantes,
-            "%_CRUCE": cruzados / total if total else 0,
-            "%_NO_ENCONTRADO": no_encontrados / total if total else 0,
+            "MANEJADOR2": manejador if str(manejador).strip() else "SIN MANEJADOR",
+            "FILAS_BNC": len(g),
+            "CONCATENAR_UNICOS_BNC": claves,
+            "FILAS_CRUZADAS": int((g["ESTADO_CRUCE"] == "CRUZADO").sum()),
+            "FILAS_NO_ENCONTRADAS": int((g["ESTADO_CRUCE"] == "NO ENCONTRADO EN R34").sum()),
+            "CONCATENAR_UNICOS_CRUZADOS": cruzadas,
+            "CONCATENAR_UNICOS_NO_ENCONTRADOS": no_encontradas,
+            "%_CRUCE_UNICO": cruzadas / claves if claves else 0,
         })
 
     resumen = pd.DataFrame(filas)
@@ -557,119 +659,150 @@ def crear_resumen(df):
         return resumen
 
     resumen = resumen.sort_values(
-        ["NO_ENCONTRADOS", "REGISTROS_R34"], ascending=[False, False]
+        ["CONCATENAR_UNICOS_NO_ENCONTRADOS", "CONCATENAR_UNICOS_BNC"],
+        ascending=[False, False],
     ).reset_index(drop=True)
+
+    claves_total = resultado["CLAVE_CRUCE"].nunique()
+    claves_cruzadas = resultado.loc[
+        resultado["ESTADO_CRUCE"] == "CRUZADO", "CLAVE_CRUCE"
+    ].nunique()
+    claves_no = resultado.loc[
+        resultado["ESTADO_CRUCE"] == "NO ENCONTRADO EN R34", "CLAVE_CRUCE"
+    ].nunique()
 
     total = {
         "MANEJADOR2": "TOTAL",
-        "REGISTROS_R34": len(df),
-        "CLIENTES_UNICOS": df["CODIGO_AFIL"].nunique(),
-        "CRUZADOS": int((df["ESTADO_CRUCE"] == "CRUZADO").sum()),
-        "NO_ENCONTRADOS": int((df["ESTADO_CRUCE"] == "NO ENCONTRADO").sum()),
-        "CLIENTES_UNICOS_NO_ENCONTRADOS": df.loc[
-            df["ESTADO_CRUCE"] == "NO ENCONTRADO", "CODIGO_AFIL"
-        ].nunique(),
+        "FILAS_BNC": len(resultado),
+        "CONCATENAR_UNICOS_BNC": claves_total,
+        "FILAS_CRUZADAS": int((resultado["ESTADO_CRUCE"] == "CRUZADO").sum()),
+        "FILAS_NO_ENCONTRADAS": int((resultado["ESTADO_CRUCE"] == "NO ENCONTRADO EN R34").sum()),
+        "CONCATENAR_UNICOS_CRUZADOS": claves_cruzadas,
+        "CONCATENAR_UNICOS_NO_ENCONTRADOS": claves_no,
+        "%_CRUCE_UNICO": claves_cruzadas / claves_total if claves_total else 0,
     }
-    total["%_CRUCE"] = total["CRUZADOS"] / total["REGISTROS_R34"] if total["REGISTROS_R34"] else 0
-    total["%_NO_ENCONTRADO"] = total["NO_ENCONTRADOS"] / total["REGISTROS_R34"] if total["REGISTROS_R34"] else 0
 
     return pd.concat([resumen, pd.DataFrame([total])], ignore_index=True)
 
 
-def ajustar_anchos(ws, df, ancho_max=45):
+def ajustar_anchos(worksheet, df, inicio_col=0, max_width=45):
+    """Ajusta columnas sin fallar con floats, fechas o NaN."""
     for i, col in enumerate(df.columns):
-        valores = df[col].fillna("").astype(str)
+        if df.empty:
+            ancho_datos = 0
+        else:
+            valores = df[col].head(300).fillna("").astype(str)
+            ancho_datos = int(valores.str.len().max()) if not valores.empty else 0
 
-        ancho = max(
-            len(str(col)),
-            valores.str.len().max() if not valores.empty else 0
-        ) + 2
-
-        ws.set_column(
-            i,
-            i,
-            min(int(ancho), ancho_max)
+        ancho = max(len(str(col)), ancho_datos) + 2
+        worksheet.set_column(
+            inicio_col + i,
+            inicio_col + i,
+            min(max(ancho, 10), max_width),
         )
 
-def crear_excel(resultado, resumen, hoja_bnc, banco_objetivo, periodo_r34):
-    no_encontrados = resultado[resultado["ESTADO_CRUCE"] == "NO ENCONTRADO"].copy()
+
+def crear_excel(resultado, resumen, hoja_bnc, banco_objetivo, r34_filtrado):
+    no_encontrados = resultado[
+        resultado["ESTADO_CRUCE"] == "NO ENCONTRADO EN R34"
+    ].copy()
     cruzados = resultado[resultado["ESTADO_CRUCE"] == "CRUZADO"].copy()
 
     salida = io.BytesIO()
+
     with pd.ExcelWriter(salida, engine="xlsxwriter") as writer:
         workbook = writer.book
 
         fmt_titulo = workbook.add_format({
-            "bold": True, "font_size": 16, "font_color": "#FFFFFF",
-            "bg_color": "#1F4E78", "align": "center", "valign": "vcenter"
+            "bold": True,
+            "font_size": 16,
+            "font_color": "#FFFFFF",
+            "bg_color": "#1F4E78",
+            "align": "center",
+            "valign": "vcenter",
         })
         fmt_header = workbook.add_format({
-            "bold": True, "font_color": "#FFFFFF", "bg_color": "#4472C4",
-            "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True
+            "bold": True,
+            "font_color": "#FFFFFF",
+            "bg_color": "#4472C4",
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+            "text_wrap": True,
         })
         fmt_label = workbook.add_format({
-            "bold": True, "bg_color": "#D9EAF7", "border": 1
+            "bold": True,
+            "bg_color": "#D9EAF7",
+            "border": 1,
         })
         fmt_valor = workbook.add_format({"border": 1})
         fmt_pct = workbook.add_format({"num_format": "0.00%", "border": 1})
         fmt_rojo = workbook.add_format({"bg_color": "#FCE4D6"})
         fmt_verde = workbook.add_format({"bg_color": "#E2F0D9"})
 
-        # -------- RESUMEN --------
-        resumen.to_excel(writer, sheet_name="RESUMEN", index=False, startrow=10)
+        # ---------------- RESUMEN ----------------
+        resumen.to_excel(writer, sheet_name="RESUMEN", index=False, startrow=12)
         ws = writer.sheets["RESUMEN"]
         ws.merge_range("A1:H1", "VALIDACIÓN BNC — R34 VS RECAUDACIÓN", fmt_titulo)
         ws.set_row(0, 28)
 
-        total_reg = len(resultado)
-        total_cruz = int((resultado["ESTADO_CRUCE"] == "CRUZADO").sum())
-        total_no = int((resultado["ESTADO_CRUCE"] == "NO ENCONTRADO").sum())
-        clientes_no = resultado.loc[
-            resultado["ESTADO_CRUCE"] == "NO ENCONTRADO", "CODIGO_AFIL"
+        claves_total = resultado["CLAVE_CRUCE"].nunique()
+        claves_cruzadas = resultado.loc[
+            resultado["ESTADO_CRUCE"] == "CRUZADO", "CLAVE_CRUCE"
+        ].nunique()
+        claves_no = resultado.loc[
+            resultado["ESTADO_CRUCE"] == "NO ENCONTRADO EN R34", "CLAVE_CRUCE"
         ].nunique()
 
         metricas = [
-            ("Período / hoja BNC", hoja_bnc),
-            ("FECHA_INSTALACION usada en R34", periodo_r34),
+            ("Hoja BNC analizada", hoja_bnc),
             ("Banco filtrado en R34", banco_objetivo),
-            ("Registros R34 válidos", total_reg),
-            ("Casos cruzados", total_cruz),
-            ("Casos no encontrados", total_no),
-            ("Clientes únicos no encontrados", clientes_no),
-            ("% cruce", total_cruz / total_reg if total_reg else 0),
+            ("Registros R34 después de filtros", len(r34_filtrado)),
+            ("Concatenar únicos R34", r34_filtrado["CLAVE_CRUCE"].nunique()),
+            ("Filas BNC analizadas", len(resultado)),
+            ("Concatenar únicos BNC", claves_total),
+            ("Concatenar únicos cruzados", claves_cruzadas),
+            ("Concatenar únicos NO encontrados en R34", claves_no),
+            ("% cruce de Concatenar únicos", claves_cruzadas / claves_total if claves_total else 0),
         ]
 
         for fila, (label, valor) in enumerate(metricas, start=2):
             ws.write(fila, 0, label, fmt_label)
-            if label == "% cruce":
+            if label.startswith("%"):
                 ws.write(fila, 1, valor, fmt_pct)
             else:
                 ws.write(fila, 1, valor, fmt_valor)
 
-        ws.write(9, 0, "Resumen por MANEJADOR2", fmt_label)
+        ws.write(11, 0, "Resumen por MANEJADOR2", fmt_label)
         for col_idx, col in enumerate(resumen.columns):
-            ws.write(10, col_idx, col, fmt_header)
-        if not resumen.empty:
-            ws.autofilter(10, 0, 10 + len(resumen), len(resumen.columns) - 1)
-        ws.freeze_panes(11, 0)
-        ajustar_anchos(ws, resumen)
-        ws.set_column(0, 0, 28)
-        ws.set_column(6, 7, 16, fmt_pct)
+            ws.write(12, col_idx, col, fmt_header)
 
-        # -------- DETALLES --------
+        if not resumen.empty:
+            ws.autofilter(12, 0, 12 + len(resumen), len(resumen.columns) - 1)
+        ws.freeze_panes(13, 0)
+        ajustar_anchos(ws, resumen)
+        ws.set_column(0, 0, 30)
+        if "%_CRUCE_UNICO" in resumen.columns:
+            idx_pct = resumen.columns.get_loc("%_CRUCE_UNICO")
+            ws.set_column(idx_pct, idx_pct, 18, fmt_pct)
+
+        # ---------------- DETALLES ----------------
         for nombre_hoja, df_detalle, color_fmt in [
             ("NO ENCONTRADOS", no_encontrados, fmt_rojo),
             ("CASOS CRUZADOS", cruzados, fmt_verde),
         ]:
             df_detalle.to_excel(writer, sheet_name=nombre_hoja, index=False)
             wsd = writer.sheets[nombre_hoja]
+
             for col_idx, col in enumerate(df_detalle.columns):
                 wsd.write(0, col_idx, col, fmt_header)
+
             wsd.freeze_panes(1, 0)
             if len(df_detalle) > 0:
                 wsd.autofilter(0, 0, len(df_detalle), len(df_detalle.columns) - 1)
                 estado_idx = df_detalle.columns.get_loc("ESTADO_CRUCE")
-                wsd.set_column(estado_idx, estado_idx, 20, color_fmt)
+                wsd.set_column(estado_idx, estado_idx, 23, color_fmt)
+
             ajustar_anchos(wsd, df_detalle)
 
     salida.seek(0)
@@ -681,12 +814,14 @@ def crear_excel(resultado, resumen, hoja_bnc, banco_objetivo, periodo_r34):
 # ============================================================
 
 col1, col2 = st.columns(2)
+
 with col1:
     archivo_recaudacion = st.file_uploader(
         "1. Recaudación Agentes Autorizados",
         type=["xlsx"],
         key="recaudacion",
     )
+
 with col2:
     archivo_diccionario = st.file_uploader(
         "2. Diccionario de manejadores",
@@ -695,7 +830,7 @@ with col2:
     )
 
 archivos_r34 = st.file_uploader(
-    "3. R34 (puedes subir CSV, XLSX o ZIP; también varios archivos)",
+    "3. R34 (CSV, XLSX o ZIP; también puedes subir varios)",
     type=["csv", "txt", "xlsx", "xlsm", "zip"],
     accept_multiple_files=True,
     key="r34",
@@ -704,7 +839,7 @@ archivos_r34 = st.file_uploader(
 banco_objetivo = st.text_input(
     "Banco que debe aparecer en NOMBRE_BANCO del R34",
     value="B.O.D",
-    help="Lo dejé en B.O.D porque esa fue la regla indicada. Si cambia, puedes escribir otro valor aquí.",
+    help="B.O.D, BOD y variantes con puntos se comparan de forma normalizada.",
 )
 
 hoja_bnc = None
@@ -712,6 +847,7 @@ if archivo_recaudacion is not None:
     try:
         rec_bytes = archivo_recaudacion.getvalue()
         opciones_bnc = hojas_bnc(rec_bytes)
+
         if not opciones_bnc:
             st.error("No encontré ninguna hoja cuyo nombre empiece por BNC.")
         else:
@@ -722,16 +858,13 @@ if archivo_recaudacion is not None:
                 opciones_bnc,
                 index=indice,
             )
-            try:
-                _mes, _anio, _periodo = extraer_periodo_hoja_bnc(hoja_bnc)
-                st.info(
-                    f"El R34 se filtrará SOLO por FECHA_INSTALACION de {_periodo}. "
-                    "Las filas de otros meses o años se ignorarán."
-                )
-            except Exception as e:
-                st.warning(str(e))
+            st.info(
+                "No se filtra el R34 por FECHA_INSTALACION. Se usan todos los registros "
+                "del R34 que cumplan PERTENENCIA, MANEJADOR, POS_CON_TRANSACCION y NOMBRE_BANCO."
+            )
     except Exception as e:
         st.error(f"No pude leer las hojas de Recaudación: {e}")
+
 
 if st.button("Procesar validación", type="primary", use_container_width=True):
     if archivo_recaudacion is None or archivo_diccionario is None or not archivos_r34:
@@ -741,15 +874,16 @@ if st.button("Procesar validación", type="primary", use_container_width=True):
     else:
         try:
             with st.spinner("Procesando archivos..."):
-                mes_objetivo, anio_objetivo, periodo_r34 = extraer_periodo_hoja_bnc(hoja_bnc)
                 mapa = cargar_diccionario(archivo_diccionario.getvalue())
-                rec_agg = cargar_recaudacion(archivo_recaudacion.getvalue(), hoja_bnc)
+                bnc = cargar_recaudacion(
+                    archivo_recaudacion.getvalue(), hoja_bnc, mapa
+                )
 
                 partes = []
                 for i, archivo in enumerate(archivos_r34, start=1):
                     st.write(f"Procesando R34 {i}/{len(archivos_r34)}: {archivo.name}")
                     parte = procesar_upload_r34(
-                        archivo, mapa, banco_objetivo, mes_objetivo, anio_objetivo
+                        archivo, mapa, banco_objetivo
                     )
                     if not parte.empty:
                         partes.append(parte)
@@ -757,48 +891,36 @@ if st.button("Procesar validación", type="primary", use_container_width=True):
                 if not partes:
                     raise ValueError(
                         "Después de aplicar los filtros no quedó ningún registro del R34. "
-                        f"Revisa FECHA_INSTALACION ({periodo_r34}), PERTENENCIA, MANEJADOR, "
-                        "POS_CON_TRANSACCION y NOMBRE_BANCO."
+                        "Revisa PERTENENCIA, MANEJADOR, POS_CON_TRANSACCION y NOMBRE_BANCO."
                     )
 
                 r34_filtrado = pd.concat(partes, ignore_index=True)
-                resultado = r34_filtrado.merge(rec_agg, on="CLAVE_CRUCE", how="left")
-                resultado["ESTADO_CRUCE"] = resultado["COINCIDENCIAS_RECAUDACION"].apply(
-                    lambda x: "CRUZADO" if pd.notna(x) else "NO ENCONTRADO"
-                )
-                resultado["COINCIDENCIAS_RECAUDACION"] = (
-                    resultado["COINCIDENCIAS_RECAUDACION"].fillna(0).astype(int)
-                )
-
-                # Orden de columnas más útil para revisión.
-                primeras = [
-                    "ESTADO_CRUCE", "CLAVE_CRUCE", "CODIGO_AFIL", "NUMPOS",
-                    "NOMBRE_AFILIADO", "RIF_AFILIADO", "PERTENENCIA",
-                    "MANEJADOR", "MANEJADOR2", "NOMBRE_BANCO",
-                    "POS_CON_TRANSACCION", "FECHA_INSTALACION", "CIUDAD", "ESTADO",
-                    "COINCIDENCIAS_RECAUDACION", "ARCHIVO_R34"
-                ]
-                primeras = [c for c in primeras if c in resultado.columns]
-                resto = [c for c in resultado.columns if c not in primeras]
-                resultado = resultado[primeras + resto]
-
+                resultado = cruzar_bnc_con_r34(bnc, r34_filtrado)
                 resumen = crear_resumen(resultado)
                 excel = crear_excel(
-                    resultado, resumen, hoja_bnc, banco_objetivo, periodo_r34
+                    resultado, resumen, hoja_bnc, banco_objetivo, r34_filtrado
                 )
 
-                periodo_archivo = re.sub(r"[^A-Za-z0-9_-]+", "_", hoja_bnc).strip("_")
+                periodo_archivo = re.sub(
+                    r"[^A-Za-z0-9_-]+", "_", hoja_bnc
+                ).strip("_")
                 nombre_salida = f"Validacion_BNC_{periodo_archivo}.xlsx"
+
+                claves_bnc = resultado["CLAVE_CRUCE"].nunique()
+                claves_cruzadas = resultado.loc[
+                    resultado["ESTADO_CRUCE"] == "CRUZADO", "CLAVE_CRUCE"
+                ].nunique()
+                claves_no = resultado.loc[
+                    resultado["ESTADO_CRUCE"] == "NO ENCONTRADO EN R34", "CLAVE_CRUCE"
+                ].nunique()
 
                 st.session_state["resultado_excel"] = excel
                 st.session_state["nombre_salida"] = nombre_salida
                 st.session_state["metricas_resultado"] = {
-                    "validos": len(resultado),
-                    "cruzados": int((resultado["ESTADO_CRUCE"] == "CRUZADO").sum()),
-                    "no_encontrados": int((resultado["ESTADO_CRUCE"] == "NO ENCONTRADO").sum()),
-                    "clientes_no": resultado.loc[
-                        resultado["ESTADO_CRUCE"] == "NO ENCONTRADO", "CODIGO_AFIL"
-                    ].nunique(),
+                    "r34_validos": len(r34_filtrado),
+                    "bnc_unicos": claves_bnc,
+                    "cruzados_unicos": claves_cruzadas,
+                    "no_encontrados_unicos": claves_no,
                 }
 
             st.success("Validación terminada.")
@@ -810,10 +932,10 @@ if st.button("Procesar validación", type="primary", use_container_width=True):
 if st.session_state.get("resultado_excel"):
     m = st.session_state["metricas_resultado"]
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Registros R34 válidos", f"{m['validos']:,}")
-    c2.metric("Casos cruzados", f"{m['cruzados']:,}")
-    c3.metric("No encontrados", f"{m['no_encontrados']:,}")
-    c4.metric("Clientes únicos faltantes", f"{m['clientes_no']:,}")
+    c1.metric("Registros R34 válidos", f"{m['r34_validos']:,}")
+    c2.metric("Concatenar únicos BNC", f"{m['bnc_unicos']:,}")
+    c3.metric("Cruzados", f"{m['cruzados_unicos']:,}")
+    c4.metric("BNC no encontrados en R34", f"{m['no_encontrados_unicos']:,}")
 
     st.download_button(
         "Descargar Excel de validación",
