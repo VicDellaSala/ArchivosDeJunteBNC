@@ -576,12 +576,20 @@ def crear_resumen(df):
     return pd.concat([resumen, pd.DataFrame([total])], ignore_index=True)
 
 
-def ajustar_anchos(worksheet, df, inicio_col=0, max_width=34):
+def ajustar_anchos(ws, df, ancho_max=45):
     for i, col in enumerate(df.columns):
-        valores = df[col].astype(str).head(300)
-        ancho = max(len(str(col)), *(len(v) for v in valores)) + 2 if len(valores) else len(str(col)) + 2
-        worksheet.set_column(inicio_col + i, inicio_col + i, min(ancho, max_width))
+        valores = df[col].fillna("").astype(str)
 
+        ancho = max(
+            len(str(col)),
+            valores.str.len().max() if not valores.empty else 0
+        ) + 2
+
+        ws.set_column(
+            i,
+            i,
+            min(int(ancho), ancho_max)
+        )
 
 def crear_excel(resultado, resumen, hoja_bnc, banco_objetivo, periodo_r34):
     no_encontrados = resultado[resultado["ESTADO_CRUCE"] == "NO ENCONTRADO"].copy()
