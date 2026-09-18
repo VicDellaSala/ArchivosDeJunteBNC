@@ -17,7 +17,7 @@ st.set_page_config(page_title="Validación BNC - R34 vs Recaudación", layout="w
 
 st.title("Validación BNC — R34 vs Recaudación")
 st.caption(
-    "Filtra el R34 con las reglas definidas y compara la hoja BNC seleccionada contra esos registros."
+    "Filtra el R34 con las reglas definidas y verifica cuáles registros aparecen en la hoja BNC seleccionada."
 )
 
 
@@ -558,57 +558,50 @@ def procesar_upload_r34(upload, mapa_manejadores, banco_objetivo):
 
 
 # ============================================================
-# CRUCE: LA BASE DE SALIDA ES BNC
+# CRUCE: LA BASE ES EL R34
 # ============================================================
 
-def preparar_r34_para_cruce(r34_filtrado):
+def cruzar_r34_con_bnc(bnc, r34_filtrado):
     """
-    Deja una fila representativa por CLAVE_CRUCE para que un duplicado del R34
-    no multiplique las filas de BNC al hacer el merge.
+    Regla correcta:
+    - La base es el R34 ya filtrado.
+    - CRUZADO: el CLAVE_CRUCE del R34 aparece al menos una vez en BNC.
+    - NO CRUZADO: el CLAVE_CRUCE del R34 no aparece en BNC.
+    - En CASOS CRUZADOS se conservan TODAS las filas de BNC. Si una clave
+      aparece 2 veces en BNC, se muestran las 2 filas con sus fechas/pagos.
     """
-    conteos = (
-        r34_filtrado.groupby("CLAVE_CRUCE", as_index=False)
+    r34 = r34_filtrado.copy().reset_index(drop=True)
+    bnc = bnc.copy().reset_index(drop=True)
+
+    conteos_bnc = (
+        bnc.groupby("CLAVE_CRUCE", as_index=False)
         .size()
-        .rename(columns={"size": "COINCIDENCIAS_R34"})
+        .rename(columns={"size": "COINCIDENCIAS_BNC"})
     )
 
-    detalle = r34_filtrado.drop_duplicates("CLAVE_CRUCE", keep="first").copy()
-    return detalle.merge(conteos, on="CLAVE_CRUCE", how="left")
-
-
-def cruzar_bnc_con_r34(bnc, r34_filtrado):
-    """
-    Última regla indicada:
-    NO ENCONTRADOS = registros que ESTÁN EN BNC pero cuya CLAVE_CRUCE NO existe en R34.
-    CASOS CRUZADOS = registros de BNC cuya CLAVE_CRUCE sí existe en R34.
-    """
-    r34_unico = preparar_r34_para_cruce(r34_filtrado)
-    resultado = bnc.merge(r34_unico, on="CLAVE_CRUCE", how="left")
-
-    resultado["ESTADO_CRUCE"] = resultado["COINCIDENCIAS_R34"].apply(
-        lambda x: "CRUZADO" if pd.notna(x) else "NO ENCONTRADO EN R34"
-    )
-    resultado["COINCIDENCIAS_R34"] = (
-        resultado["COINCIDENCIAS_R34"].fillna(0).astype(int)
+    r34 = r34.merge(conteos_bnc, on="CLAVE_CRUCE", how="left")
+    r34["COINCIDENCIAS_BNC"] = r34["COINCIDENCIAS_BNC"].fillna(0).astype(int)
+    r34["ESTADO_CRUCE"] = r34["COINCIDENCIAS_BNC"].apply(
+        lambda n: "CRUZADO" if n > 0 else "NO CRUZADO"
     )
 
-    primeras = [
+    no_cruzados = r34[r34["ESTADO_CRUCE"] == "NO CRUZADO"].copy()
+    r34_cruzados = r34[r34["ESTADO_CRUCE"] == "CRUZADO"].copy()
+
+    # Merge many-to-many intencional: conserva todas las filas de pago de BNC.
+    casos_cruzados = r34_cruzados.merge(
+        bnc,
+        on="CLAVE_CRUCE",
+        how="left",
+        suffixes=("", "_BNC"),
+    )
+
+    # Orden más cómodo para revisar el Excel.
+    orden_r34 = [
         "ESTADO_CRUCE",
         "CLAVE_CRUCE",
-        "BNC_FECHA_DOC",
-        "BNC_CLIENTE",
-        "BNC_NOMBRE",
-        "BNC_CONCATENAR",
-        "BNC_AFILIADO",
-        "BNC_TERMINAL",
-        "BNC_PAGO_CCR_USD",
-        "BNC_PAGO_BAN_USD",
-        "BNC_PAGO_AA_USD",
-        "BNC_MANEJADOR_R34",
-        "BNC_MANEJADOR_R34_MODIFICADO",
-        "MANEJADOR2_BNC",
-        "BNC_EQUIPO_R34",
-        "COINCIDENCIAS_R34",
+        "COINCIDENCIAS_BNC",
+        "ARCHIVO_R34",
         "R34_CODIGO_AFIL",
         "R34_NUMPOS",
         "R34_NOMBRE_AFILIADO",
@@ -622,36 +615,65 @@ def cruzar_bnc_con_r34(bnc, r34_filtrado):
         "R34_SERIAL",
         "R34_CIUDAD",
         "R34_ESTADO",
-        "ARCHIVO_R34",
+        "R34_AFIPOS",
     ]
-    primeras = [c for c in primeras if c in resultado.columns]
-    resto = [c for c in resultado.columns if c not in primeras]
-    return resultado[primeras + resto]
+    orden_bnc = [
+        "BNC_FECHA_DOC",
+        "BNC_CLIENTE",
+        "BNC_NOMBRE",
+        "BNC_CONCATENAR",
+        "BNC_AFILIADO",
+        "BNC_TERMINAL",
+        "BNC_PAGO_CCR_USD",
+        "BNC_PAGO_BAN_USD",
+        "BNC_PAGO_AA_USD",
+        "BNC_MANEJADOR_R34",
+        "BNC_MANEJADOR_R34_MODIFICADO",
+        "MANEJADOR2_BNC",
+        "BNC_EQUIPO_R34",
+    ]
+
+    def reordenar(df, preferidas):
+        primeras = [c for c in preferidas if c in df.columns]
+        resto = [c for c in df.columns if c not in primeras]
+        return df[primeras + resto]
+
+    r34 = reordenar(r34, orden_r34)
+    no_cruzados = reordenar(no_cruzados, orden_r34)
+    casos_cruzados = reordenar(casos_cruzados, orden_r34 + orden_bnc)
+
+    return r34, no_cruzados, casos_cruzados
 
 
 # ============================================================
 # RESUMEN Y EXCEL FINAL
 # ============================================================
 
-def crear_resumen(resultado):
+def crear_resumen(r34_resultado, casos_cruzados):
+    """Resumen por MANEJADOR2 usando como base las filas válidas del R34."""
     filas = []
 
-    for manejador, g in resultado.groupby("MANEJADOR2_BNC", dropna=False):
-        claves = g["CLAVE_CRUCE"].nunique()
-        cruzadas = g.loc[g["ESTADO_CRUCE"] == "CRUZADO", "CLAVE_CRUCE"].nunique()
-        no_encontradas = g.loc[
-            g["ESTADO_CRUCE"] == "NO ENCONTRADO EN R34", "CLAVE_CRUCE"
-        ].nunique()
+    pagos_por_manejador = {}
+    if not casos_cruzados.empty and "R34_MANEJADOR2" in casos_cruzados.columns:
+        pagos_por_manejador = (
+            casos_cruzados.groupby("R34_MANEJADOR2", dropna=False)
+            .size()
+            .to_dict()
+        )
+
+    for manejador, g in r34_resultado.groupby("R34_MANEJADOR2", dropna=False):
+        total = len(g)
+        cruzados = int((g["ESTADO_CRUCE"] == "CRUZADO").sum())
+        no_cruzados = int((g["ESTADO_CRUCE"] == "NO CRUZADO").sum())
+        clave_manejador = manejador if str(manejador).strip() else "SIN MANEJADOR"
 
         filas.append({
-            "MANEJADOR2": manejador if str(manejador).strip() else "SIN MANEJADOR",
-            "FILAS_BNC": len(g),
-            "CONCATENAR_UNICOS_BNC": claves,
-            "FILAS_CRUZADAS": int((g["ESTADO_CRUCE"] == "CRUZADO").sum()),
-            "FILAS_NO_ENCONTRADAS": int((g["ESTADO_CRUCE"] == "NO ENCONTRADO EN R34").sum()),
-            "CONCATENAR_UNICOS_CRUZADOS": cruzadas,
-            "CONCATENAR_UNICOS_NO_ENCONTRADOS": no_encontradas,
-            "%_CRUCE_UNICO": cruzadas / claves if claves else 0,
+            "MANEJADOR2": clave_manejador,
+            "REGISTROS_R34_VALIDOS": total,
+            "R34_CRUZADOS": cruzados,
+            "R34_NO_CRUZADOS": no_cruzados,
+            "%_CRUCE": cruzados / total if total else 0,
+            "FILAS_PAGO_BNC_EN_CRUZADOS": int(pagos_por_manejador.get(manejador, 0)),
         })
 
     resumen = pd.DataFrame(filas)
@@ -659,27 +681,21 @@ def crear_resumen(resultado):
         return resumen
 
     resumen = resumen.sort_values(
-        ["CONCATENAR_UNICOS_NO_ENCONTRADOS", "CONCATENAR_UNICOS_BNC"],
+        ["R34_NO_CRUZADOS", "REGISTROS_R34_VALIDOS"],
         ascending=[False, False],
     ).reset_index(drop=True)
 
-    claves_total = resultado["CLAVE_CRUCE"].nunique()
-    claves_cruzadas = resultado.loc[
-        resultado["ESTADO_CRUCE"] == "CRUZADO", "CLAVE_CRUCE"
-    ].nunique()
-    claves_no = resultado.loc[
-        resultado["ESTADO_CRUCE"] == "NO ENCONTRADO EN R34", "CLAVE_CRUCE"
-    ].nunique()
+    total_r34 = len(r34_resultado)
+    total_cruzados = int((r34_resultado["ESTADO_CRUCE"] == "CRUZADO").sum())
+    total_no = int((r34_resultado["ESTADO_CRUCE"] == "NO CRUZADO").sum())
 
     total = {
         "MANEJADOR2": "TOTAL",
-        "FILAS_BNC": len(resultado),
-        "CONCATENAR_UNICOS_BNC": claves_total,
-        "FILAS_CRUZADAS": int((resultado["ESTADO_CRUCE"] == "CRUZADO").sum()),
-        "FILAS_NO_ENCONTRADAS": int((resultado["ESTADO_CRUCE"] == "NO ENCONTRADO EN R34").sum()),
-        "CONCATENAR_UNICOS_CRUZADOS": claves_cruzadas,
-        "CONCATENAR_UNICOS_NO_ENCONTRADOS": claves_no,
-        "%_CRUCE_UNICO": claves_cruzadas / claves_total if claves_total else 0,
+        "REGISTROS_R34_VALIDOS": total_r34,
+        "R34_CRUZADOS": total_cruzados,
+        "R34_NO_CRUZADOS": total_no,
+        "%_CRUCE": total_cruzados / total_r34 if total_r34 else 0,
+        "FILAS_PAGO_BNC_EN_CRUZADOS": len(casos_cruzados),
     }
 
     return pd.concat([resumen, pd.DataFrame([total])], ignore_index=True)
@@ -692,7 +708,8 @@ def ajustar_anchos(worksheet, df, inicio_col=0, max_width=45):
             ancho_datos = 0
         else:
             valores = df[col].head(300).fillna("").astype(str)
-            ancho_datos = int(valores.str.len().max()) if not valores.empty else 0
+            largo = valores.str.len().max()
+            ancho_datos = 0 if pd.isna(largo) else int(largo)
 
         ancho = max(len(str(col)), ancho_datos) + 2
         worksheet.set_column(
@@ -702,12 +719,15 @@ def ajustar_anchos(worksheet, df, inicio_col=0, max_width=45):
         )
 
 
-def crear_excel(resultado, resumen, hoja_bnc, banco_objetivo, r34_filtrado):
-    no_encontrados = resultado[
-        resultado["ESTADO_CRUCE"] == "NO ENCONTRADO EN R34"
-    ].copy()
-    cruzados = resultado[resultado["ESTADO_CRUCE"] == "CRUZADO"].copy()
-
+def crear_excel(
+    r34_resultado,
+    no_cruzados,
+    casos_cruzados,
+    resumen,
+    hoja_bnc,
+    banco_objetivo,
+    bnc,
+):
     salida = io.BytesIO()
 
     with pd.ExcelWriter(salida, engine="xlsxwriter") as writer:
@@ -746,24 +766,20 @@ def crear_excel(resultado, resumen, hoja_bnc, banco_objetivo, r34_filtrado):
         ws.merge_range("A1:H1", "VALIDACIÓN BNC — R34 VS RECAUDACIÓN", fmt_titulo)
         ws.set_row(0, 28)
 
-        claves_total = resultado["CLAVE_CRUCE"].nunique()
-        claves_cruzadas = resultado.loc[
-            resultado["ESTADO_CRUCE"] == "CRUZADO", "CLAVE_CRUCE"
-        ].nunique()
-        claves_no = resultado.loc[
-            resultado["ESTADO_CRUCE"] == "NO ENCONTRADO EN R34", "CLAVE_CRUCE"
-        ].nunique()
+        total_r34 = len(r34_resultado)
+        total_cruzados = int((r34_resultado["ESTADO_CRUCE"] == "CRUZADO").sum())
+        total_no = int((r34_resultado["ESTADO_CRUCE"] == "NO CRUZADO").sum())
 
         metricas = [
             ("Hoja BNC analizada", hoja_bnc),
             ("Banco filtrado en R34", banco_objetivo),
-            ("Registros R34 después de filtros", len(r34_filtrado)),
-            ("Concatenar únicos R34", r34_filtrado["CLAVE_CRUCE"].nunique()),
-            ("Filas BNC analizadas", len(resultado)),
-            ("Concatenar únicos BNC", claves_total),
-            ("Concatenar únicos cruzados", claves_cruzadas),
-            ("Concatenar únicos NO encontrados en R34", claves_no),
-            ("% cruce de Concatenar únicos", claves_cruzadas / claves_total if claves_total else 0),
+            ("Registros R34 válidos", total_r34),
+            ("R34 cruzados", total_cruzados),
+            ("R34 NO cruzados", total_no),
+            ("% cruce R34", total_cruzados / total_r34 if total_r34 else 0),
+            ("Filas BNC analizadas", len(bnc)),
+            ("Concatenar únicos BNC", bnc["CLAVE_CRUCE"].nunique()),
+            ("Filas en CASOS CRUZADOS", len(casos_cruzados)),
         ]
 
         for fila, (label, valor) in enumerate(metricas, start=2):
@@ -782,28 +798,35 @@ def crear_excel(resultado, resumen, hoja_bnc, banco_objetivo, r34_filtrado):
         ws.freeze_panes(13, 0)
         ajustar_anchos(ws, resumen)
         ws.set_column(0, 0, 30)
-        if "%_CRUCE_UNICO" in resumen.columns:
-            idx_pct = resumen.columns.get_loc("%_CRUCE_UNICO")
-            ws.set_column(idx_pct, idx_pct, 18, fmt_pct)
+        if "%_CRUCE" in resumen.columns:
+            idx_pct = resumen.columns.get_loc("%_CRUCE")
+            ws.set_column(idx_pct, idx_pct, 16, fmt_pct)
 
-        # ---------------- DETALLES ----------------
-        for nombre_hoja, df_detalle, color_fmt in [
-            ("NO ENCONTRADOS", no_encontrados, fmt_rojo),
-            ("CASOS CRUZADOS", cruzados, fmt_verde),
-        ]:
-            df_detalle.to_excel(writer, sheet_name=nombre_hoja, index=False)
-            wsd = writer.sheets[nombre_hoja]
+        # ---------------- NO CRUZADOS ----------------
+        no_cruzados.to_excel(writer, sheet_name="NO CRUZADOS", index=False)
+        ws_no = writer.sheets["NO CRUZADOS"]
+        for col_idx, col in enumerate(no_cruzados.columns):
+            ws_no.write(0, col_idx, col, fmt_header)
+        ws_no.freeze_panes(1, 0)
+        if len(no_cruzados) > 0:
+            ws_no.autofilter(0, 0, len(no_cruzados), len(no_cruzados.columns) - 1)
+            if "ESTADO_CRUCE" in no_cruzados.columns:
+                idx = no_cruzados.columns.get_loc("ESTADO_CRUCE")
+                ws_no.set_column(idx, idx, 18, fmt_rojo)
+        ajustar_anchos(ws_no, no_cruzados)
 
-            for col_idx, col in enumerate(df_detalle.columns):
-                wsd.write(0, col_idx, col, fmt_header)
-
-            wsd.freeze_panes(1, 0)
-            if len(df_detalle) > 0:
-                wsd.autofilter(0, 0, len(df_detalle), len(df_detalle.columns) - 1)
-                estado_idx = df_detalle.columns.get_loc("ESTADO_CRUCE")
-                wsd.set_column(estado_idx, estado_idx, 23, color_fmt)
-
-            ajustar_anchos(wsd, df_detalle)
+        # ---------------- CASOS CRUZADOS ----------------
+        casos_cruzados.to_excel(writer, sheet_name="CASOS CRUZADOS", index=False)
+        ws_ok = writer.sheets["CASOS CRUZADOS"]
+        for col_idx, col in enumerate(casos_cruzados.columns):
+            ws_ok.write(0, col_idx, col, fmt_header)
+        ws_ok.freeze_panes(1, 0)
+        if len(casos_cruzados) > 0:
+            ws_ok.autofilter(0, 0, len(casos_cruzados), len(casos_cruzados.columns) - 1)
+            if "ESTADO_CRUCE" in casos_cruzados.columns:
+                idx = casos_cruzados.columns.get_loc("ESTADO_CRUCE")
+                ws_ok.set_column(idx, idx, 18, fmt_verde)
+        ajustar_anchos(ws_ok, casos_cruzados)
 
     salida.seek(0)
     return salida.getvalue()
@@ -895,10 +918,18 @@ if st.button("Procesar validación", type="primary", use_container_width=True):
                     )
 
                 r34_filtrado = pd.concat(partes, ignore_index=True)
-                resultado = cruzar_bnc_con_r34(bnc, r34_filtrado)
-                resumen = crear_resumen(resultado)
+                r34_resultado, no_cruzados, casos_cruzados = cruzar_r34_con_bnc(
+                    bnc, r34_filtrado
+                )
+                resumen = crear_resumen(r34_resultado, casos_cruzados)
                 excel = crear_excel(
-                    resultado, resumen, hoja_bnc, banco_objetivo, r34_filtrado
+                    r34_resultado,
+                    no_cruzados,
+                    casos_cruzados,
+                    resumen,
+                    hoja_bnc,
+                    banco_objetivo,
+                    bnc,
                 )
 
                 periodo_archivo = re.sub(
@@ -906,21 +937,17 @@ if st.button("Procesar validación", type="primary", use_container_width=True):
                 ).strip("_")
                 nombre_salida = f"Validacion_BNC_{periodo_archivo}.xlsx"
 
-                claves_bnc = resultado["CLAVE_CRUCE"].nunique()
-                claves_cruzadas = resultado.loc[
-                    resultado["ESTADO_CRUCE"] == "CRUZADO", "CLAVE_CRUCE"
-                ].nunique()
-                claves_no = resultado.loc[
-                    resultado["ESTADO_CRUCE"] == "NO ENCONTRADO EN R34", "CLAVE_CRUCE"
-                ].nunique()
+                total_r34 = len(r34_resultado)
+                total_cruzados = int((r34_resultado["ESTADO_CRUCE"] == "CRUZADO").sum())
+                total_no = int((r34_resultado["ESTADO_CRUCE"] == "NO CRUZADO").sum())
 
                 st.session_state["resultado_excel"] = excel
                 st.session_state["nombre_salida"] = nombre_salida
                 st.session_state["metricas_resultado"] = {
-                    "r34_validos": len(r34_filtrado),
-                    "bnc_unicos": claves_bnc,
-                    "cruzados_unicos": claves_cruzadas,
-                    "no_encontrados_unicos": claves_no,
+                    "r34_validos": total_r34,
+                    "r34_cruzados": total_cruzados,
+                    "r34_no_cruzados": total_no,
+                    "filas_cruzados": len(casos_cruzados),
                 }
 
             st.success("Validación terminada.")
@@ -933,9 +960,9 @@ if st.session_state.get("resultado_excel"):
     m = st.session_state["metricas_resultado"]
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Registros R34 válidos", f"{m['r34_validos']:,}")
-    c2.metric("Concatenar únicos BNC", f"{m['bnc_unicos']:,}")
-    c3.metric("Cruzados", f"{m['cruzados_unicos']:,}")
-    c4.metric("BNC no encontrados en R34", f"{m['no_encontrados_unicos']:,}")
+    c2.metric("R34 cruzados", f"{m['r34_cruzados']:,}")
+    c3.metric("R34 NO cruzados", f"{m['r34_no_cruzados']:,}")
+    c4.metric("Filas en CASOS CRUZADOS", f"{m['filas_cruzados']:,}")
 
     st.download_button(
         "Descargar Excel de validación",
