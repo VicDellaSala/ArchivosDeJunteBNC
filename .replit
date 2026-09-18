@@ -1,0 +1,7 @@
+modules = ["python-3.11"]
+[nix]
+packages = ["glibcLocales", "streamlit"]
+
+[[ports]]
+localPort = 8501
+externalPort = 80
